@@ -1,4 +1,4 @@
-name: Build Wheels
+name: Build Tensor Core Wheels
 
 on:
   workflow_dispatch:
@@ -7,11 +7,6 @@ on:
         description: 'Version tag of llama-cpp-python to build: v0.2.14'
         default: 'v0.2.14'
         required: true
-        type: string
-      cpu:
-        description: 'Build CPU-only wheels as well? 0/1 Does not use config or exclude.'
-        default: '1'
-        required: false
         type: string
       config:
         description: 'Override configurations to build: key1:item1-1,item1-2;key2:item2-1,item2-2'
@@ -29,11 +24,6 @@ on:
         description: 'Version tag of llama-cpp-python to build: v0.2.14'
         default: 'v0.2.14'
         required: true
-        type: string
-      cpu:
-        description: 'Build CPU-only wheels as well? 0/1 Does not use config or exclude.'
-        default: '1'
-        required: false
         type: string
       config:
         description: 'Configurations to build: key1:item1-1,item1-2;key2:item2-1,item2-2'
@@ -67,10 +57,10 @@ jobs:
         id: set-matrix
         run: |
           $matrix = @{
-              'os' = 'ubuntu-20.04', 'windows-latest'
-              'pyver' = "3.10", "3.8", "3.9", "3.11"
-              'cuda' = "11.6.2", "11.7.1", "11.8.0", "12.0.1", "12.1.1", "12.2.0"
-              'releasetag' = "AVX", "wheels", "AVX512", "basic"
+              'os' = 'ubuntu-20.04', 'windows-2019'
+              'pyver' = "3.11", "3.10"
+              'cuda' =  "11.8.0", "12.1.1"
+              'avxver' = "AVX2", "AVX"
           }
           
           if ($env:CONFIGIN -ne 'Default') {$env:CONFIGIN.split(';').foreach({$matrix[$_.split(':')[0]] = $_.split(':')[1].split(',')})}
@@ -85,7 +75,7 @@ jobs:
           Write-Output ('matrix=' + $matrixOut) >> $env:GITHUB_OUTPUT
           
   build_wheels:
-    name: Build Wheel ${{ matrix.os }} ${{ matrix.pyver }} ${{ matrix.cuda }} ${{ matrix.releasetag == 'wheels' && 'AVX2' || matrix.releasetag }}
+    name: Build Wheel ${{ matrix.os }} ${{ matrix.pyver }} ${{ matrix.cuda }} ${{ matrix.avxver }}
     needs: define_matrix
     runs-on: ${{ matrix.os }}
     strategy:
@@ -95,10 +85,16 @@ jobs:
         shell: pwsh
     env:
       CUDAVER: ${{ matrix.cuda }}
-      AVXVER: ${{ matrix.releasetag }}
+      AVXVER: ${{ matrix.avxver }}
       PCKGVER: ${{ inputs.version }}
 
     steps:
+      - name: Add MSBuild to PATH
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-msbuild@v1.1
+        with:
+          vs-version: '[16.11,16.12)'
+
       - uses: actions/checkout@v4
         with:
           repository: 'abetlen/llama-cpp-python'
@@ -142,7 +138,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           $y = (gi '.\MSBuildExtensions').fullname + '\*'
-          (gi 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\*\BuildCustomizations').fullname.foreach({cp $y $_})
+          (gi 'C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\MSBuild\Microsoft\VC\*\BuildCustomizations').fullname.foreach({cp $y $_})
           $cupath = 'CUDA_PATH_V' + $env:CUDAVER.Remove($env:CUDAVER.LastIndexOf('.')).Replace('.','_')
           echo "$cupath=$env:CONDA_PREFIX" >> $env:GITHUB_ENV
           
@@ -157,6 +153,46 @@ jobs:
           if (!(mamba list cuda)[-1].contains('cuda')) {throw 'CUDA Toolkit failed to install!'}
           python -m pip install build wheel
           
+      - name: Change Package Name
+        run: |
+          $packageVersion = [version]$env:PCKGVER.TrimStart('v')
+          $pyproject = Get-Content 'pyproject.toml' -raw
+          $cmakelists = Get-Content 'CMakeLists.txt' -raw
+          if ($packageVersion -lt [version]'0.2.0') {
+            $setup = Get-Content 'setup.py' -raw
+            $regexstr = '(?s)name="llama_cpp_python",(.+)(package_dir={"llama_cpp": "llama_cpp", "llama_cpp.server": "llama_cpp/server"},.+?packages=\["llama_cpp", "llama_cpp.server"],)'
+            if ($packageVersion -gt [version]'0.1.77') {$regexstr = '(?s)name="llama_cpp_python",(.+)(package_dir={"llama_cpp": "llama_cpp", "llama_cpp.server": "llama_cpp/server"},.+?package_data={"llama_cpp": \["py.typed"]},.+?packages=\["llama_cpp", "llama_cpp.server"],)'}
+            $regexmatch = [Regex]::Matches($setup,$regexstr)
+            if (!($regexmatch[0].Success)) {throw 'setup.py parsing failed'}
+            $newstr = 'name="llama_cpp_python_cuda_tensorcores",' + $regexmatch[0].Groups[1].Value + $regexmatch[0].Groups[2].Value.Replace('llama_cpp','llama_cpp_cuda_tensorcores')
+            $newsetup = $regexmatch[0].Result(('$`'+$newstr+'$'''))
+            New-Item 'setup.py' -itemType File -value $newsetup -force
+            $regexstr = '(?s)(?<=name = ")llama_cpp_python(".+?packages = \[{include = ")llama_cpp(".+)'
+            $regexmatch = [Regex]::Matches($pyproject,$regexstr)
+            if (!($regexmatch[0].Success)) {throw 'pyproject.toml parsing failed'}
+            $newpyproject = $regexmatch[0].Result(('$`'+'llama_cpp_python_cuda_tensorcores'+'$1llama_cpp_cuda_tensorcores$2'))
+          } else {
+            $regexstr = '(?s)(?<=\[project]\s+?name = ")llama_cpp_python(".+?all = \[\s+?")llama_cpp_python(\[.+?wheel.packages = \[")llama_cpp("].+?input = ")llama_cpp(?=/__init__.py")'
+            $regexmatch = [Regex]::Matches($pyproject,$regexstr)
+            if (!($regexmatch[0].Success)) {throw 'pyproject.toml parsing failed'}
+            $newpyproject = $regexmatch[0].Result(('$`' + 'llama_cpp_python_cuda_tensorcores' + '$1llama_cpp_cuda_tensorcores$2' + 'llama_cpp_cuda_tensorcores$3llama_cpp_cuda_tensorcores' + '$'''))
+          }
+          Copy-Item 'llama_cpp' 'llama_cpp_cuda_tensorcores' -recurse
+          New-Item 'pyproject.toml' -itemType File -value $newpyproject -force
+          New-Item 'CMakeLists.txt' -itemType File -value $cmakelists.Replace('llama_cpp','llama_cpp_cuda_tensorcores') -force
+          
+          if ($packageVersion -gt [version]'0.2.13')
+          {
+            $pyScripts = (Get-ChildItem $(Join-Path '.' 'llama_cpp_cuda_tensorcores' '*.py'))
+            $pyScripts.fullname.foreach({
+                $content = Get-Content $_ -raw
+                $content = $content -replace '(?m)^import llama_cpp\.', 'from . import '
+                $content = $content -replace '(?m)^from llama_cpp\.', 'from .'
+                $content = $content -replace '(?m)^(\s*)import llama_cpp(\s*)$', '${1}import llama_cpp_cuda_tensorcores as llama_cpp${2}'
+                $content | Set-Content $_ -NoNewline
+            })
+          }
+          
       - name: Build Wheel
         run: |
           $packageVersion = [version]$env:PCKGVER.TrimStart('v')
@@ -165,21 +201,20 @@ jobs:
           $env:CUDA_HOME = $env:CONDA_PREFIX
           if ($IsLinux) {$env:LD_LIBRARY_PATH = $env:CONDA_PREFIX + '/lib:' + $env:LD_LIBRARY_PATH}
           $env:VERBOSE = '1'
-          $env:CMAKE_ARGS = '-DLLAMA_CUBLAS=on -DCMAKE_CUDA_ARCHITECTURES=all'
-          if ($packageVersion -gt [version]'0.1.68' -and $packageVersion -lt [version]'0.1.71') {$env:CMAKE_ARGS = '-DLLAMA_CUBLAS=on -DCMAKE_CUDA_ARCHITECTURES=35-real;37-real;52;61-real;70-real;72-real;75-real;80-real;86-real;89-real;90'}
-          if ($packageVersion -gt [version]'0.1.68' -and $packageVersion -lt [version]'0.1.71' -and [version]$env:CUDAVER -ge [version]'12.0') {$env:CMAKE_ARGS = '-DLLAMA_CUBLAS=on -DCMAKE_CUDA_ARCHITECTURES=52;61-real;70-real;72-real;75-real;80-real;86-real;89-real;90'}
-          if ($packageVersion -gt [version]'0.1.68' -and $packageVersion -lt [version]'0.1.71' -and [version]$env:CUDAVER -lt [version]'11.8') {$env:CMAKE_ARGS = '-DLLAMA_CUBLAS=on -DCMAKE_CUDA_ARCHITECTURES=35-real;37-real;52;61-real;70-real;72-real;75-real;80-real;86'}
-          if ($packageVersion -gt [version]'0.2.13') {$env:CMAKE_ARGS = "-DLLAMA_NATIVE=off -DLLAMA_CUDA_FORCE_MMQ=ON $env:CMAKE_ARGS"}
+          $env:CMAKE_ARGS = '-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=all'
+          if ($packageVersion -gt [version]'0.1.68' -and $packageVersion -lt [version]'0.1.71') {$env:CMAKE_ARGS = '-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=35-real;37-real;52;61-real;70-real;72-real;75-real;80-real;86-real;89-real;90'}
+          if ($packageVersion -gt [version]'0.1.68' -and $packageVersion -lt [version]'0.1.71' -and [version]$env:CUDAVER -ge [version]'12.0') {$env:CMAKE_ARGS = '-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=52;61-real;70-real;72-real;75-real;80-real;86-real;89-real;90'}
+          if ($packageVersion -gt [version]'0.1.68' -and $packageVersion -lt [version]'0.1.71' -and [version]$env:CUDAVER -lt [version]'11.8') {$env:CMAKE_ARGS = '-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=35-real;37-real;52;61-real;70-real;72-real;75-real;80-real;86'}
+          if ($packageVersion -gt [version]'0.2.13') {$env:CMAKE_ARGS = "-DGGML_NATIVE=off $env:CMAKE_ARGS"}
           if ($packageVersion -lt [version]'0.1.66') {$env:CUDAFLAGS = '-arch=all'}
-          if ($env:AVXVER -eq 'AVX') {$env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DLLAMA_AVX2=off -DLLAMA_FMA=off -DLLAMA_F16C=off'}
-          if ($env:AVXVER -eq 'AVX512') {$env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DLLAMA_AVX512=on'}
-          if ($env:AVXVER -eq 'basic') {$env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DLLAMA_AVX=off -DLLAMA_AVX2=off -DLLAMA_FMA=off -DLLAMA_F16C=off'}
-          $buildtag = "+cu$cudaVersion"
+          if ($env:AVXVER -eq 'AVX') {$env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX2=off -DGGML_FMA=off -DGGML_F16C=off'; $cputag = 'avx'}
+          if ($env:AVXVER -eq 'basic') {$env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX=off -DGGML_AVX2=off -DGGML_FMA=off -DGGML_F16C=off'; $cputag = 'basic'}
+          $buildtag = "+cu$cudaVersion$cputag"
           if ($packageVersion -lt [version]'0.2.0') {
             $env:FORCE_CMAKE = '1'
             python -m build --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$buildtag"
           } else {
-            $initpath = Join-Path '.' 'llama_cpp' '__init__.py' -resolve
+            $initpath = Join-Path '.' 'llama_cpp_cuda_tensorcores' '__init__.py' -resolve
             $initcontent = Get-Content $initpath -raw
             $regexstr = '(?s)(?<=__version__ \= ")\d+(?:\.\d+)*(?=")'
             $regexmatch = [Regex]::Matches($initcontent,$regexstr)
@@ -194,8 +229,9 @@ jobs:
         uses: svenstaro/upload-release-action@2.7.0
         continue-on-error: true
         with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: ./dist/*.whl
-          tag: ${{ matrix.releasetag }}
+          tag: textgen-webui
           file_glob: true
           make_latest: false
           overwrite: true
@@ -203,13 +239,5 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: steps.upload-release.outcome == 'failure'
         with:
-          name: ${{ matrix.releasetag == 'wheels' && 'AVX2' || matrix.releasetag }}
+          name: textgen-webui-wheels
           path: ./dist/*.whl
-          
-  build_cpu:
-    name: Build CPU-only Wheels
-    needs: build_wheels
-    if: inputs.cpu == '1'
-    uses: ./.github/workflows/build-wheels-cpu.yml
-    with:
-      version: ${{ inputs.version }}

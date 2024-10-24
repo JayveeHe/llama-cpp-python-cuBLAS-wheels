@@ -1,4 +1,4 @@
-name: Build All ROCm Wheels
+name: Build ROCm Wheels (don't run this one directly)
 
 on:
   workflow_dispatch:
@@ -58,16 +58,18 @@ jobs:
         id: set-matrix
         run: |
           $matrix = @{
-              'os' = 'ubuntu-20.04', 'windows-latest'
-              'pyver' = "3.10", "3.8", "3.9", "3.11"
-              'rocm' = '5.4.2', '5.5', '5.5.1', '5.6.1'
-              'avx' = "AVX", "AVX2", "basic"
+              'os' = 'ubuntu-20.04', 'windows-2019'
+              'pyver' = "3.10", "3.11"
+              # 'rocm' = '6.1.2'
+              'avx' = "AVX", "AVX2"
               'rename' = '0', '1'
               'exclude' = @(
-                  @{'os' = 'windows-latest';'rocm' = '5.4.2'},
-                  @{'os' = 'windows-latest';'rocm' = '5.5'},
-                  @{'os' = 'windows-latest';'rocm' = '5.6.1'},
-                  @{'os' = 'ubuntu-20.04';'rocm' = '5.5.1'}
+                  @{'os' = 'windows-2019'}
+                  # @{'os' = 'windows-2019'},
+                  # @{'os' = 'windows-2019';'rocm' = '5.4.2'},
+                  # @{'os' = 'windows-2019';'rocm' = '5.5'},
+                  # @{'os' = 'windows-2019';'rocm' = '6.1.2'},
+                  # @{'os' = 'ubuntu-20.04';'rocm' = '5.5.1'}
               )
           }
           
@@ -96,7 +98,8 @@ jobs:
         shell: pwsh
     env:
       PCKGVER: ${{ inputs.version }}
-      ROCM_VERSION: ${{ matrix.rocm }}
+      # ROCM_VERSION: ${{ matrix.rocm }}
+      ROCM_VERSION: '6.1.2'
       AVXVER: ${{ matrix.avx }}
 
     steps:
@@ -177,7 +180,13 @@ jobs:
           if ($packageVersion -gt [version]'0.2.13')
           {
             $pyScripts = (Get-ChildItem $(Join-Path '.' 'llama_cpp_cuda' '*.py'))
-            $pyScripts.fullname.foreach({New-Item $_ -itemType File -value (Get-Content $_ -raw).replace('import llama_cpp.llama','from . import llama') -force})
+            $pyScripts.fullname.foreach({
+                $content = Get-Content $_ -raw
+                $content = $content -replace '(?m)^import llama_cpp\.', 'from . import '
+                $content = $content -replace '(?m)^from llama_cpp\.', 'from .'
+                $content = $content -replace '(?m)^(\s*)import llama_cpp(\s*)$', '${1}import llama_cpp_cuda as llama_cpp${2}'
+                $content | Set-Content $_ -NoNewline
+            })
           }
         
       - name: Build Wheel
@@ -217,16 +226,18 @@ jobs:
             New-Item $cuPath.fullname -itemType File -value $newcuFile -force
           }
           
-          if ($env:AVXVER -eq 'AVX') {$env:CMAKE_ARGS = "-GNinja -DLLAMA_HIPBLAS=ON -DLLAMA_AVX2=off -DLLAMA_FMA=off -DLLAMA_F16C=off -DGPU_TARGETS=$gputargets"}
-          if ($env:AVXVER -eq 'AVX512') {$env:CMAKE_ARGS = "-GNinja -DLLAMA_HIPBLAS=ON -DLLAMA_AVX512=on -DGPU_TARGETS=$gputargets"}
-          if ($env:AVXVER -eq 'basic') {$env:CMAKE_ARGS = "-GNinja -DLLAMA_HIPBLAS=ON -DLLAMA_AVX=off -DLLAMA_AVX2=off -DLLAMA_FMA=off -DLLAMA_F16C=off -DGPU_TARGETS=$gputargets"}
+          if ($env:AVXVER -eq 'AVX') {$env:CMAKE_ARGS = "-GNinja -DGGML_HIPBLAS=ON -DGGML_AVX2=off -DGGML_FMA=off -DGGML_F16C=off -DGPU_TARGETS=$gputargets"}
+          if ($env:AVXVER -eq 'AVX512') {$env:CMAKE_ARGS = "-GNinja -DGGML_HIPBLAS=ON -DGGML_AVX512=on -DGPU_TARGETS=$gputargets"}
+          if ($env:AVXVER -eq 'basic') {$env:CMAKE_ARGS = "-GNinja -DGGML_HIPBLAS=ON -DGGML_AVX=off -DGGML_AVX2=off -DGGML_FMA=off -DGGML_F16C=off -DGPU_TARGETS=$gputargets"}
           if ($env:AVXVER -eq 'AVX2')
           {
-              $env:CMAKE_ARGS = "-GNinja -DLLAMA_HIPBLAS=ON -DGPU_TARGETS=$gputargets"
+              $env:CMAKE_ARGS = "-GNinja -DGGML_HIPBLAS=ON -DGPU_TARGETS=$gputargets"
               $buildtag = "+rocm$env:ROCM_VERSION"
           } else {$buildtag = "+rocm$env:ROCM_VERSION$env:AVXVER"}
           
-          if ($packageVersion -gt [version]'0.2.13') {$env:CMAKE_ARGS = "-DLLAMA_NATIVE=off $env:CMAKE_ARGS"}
+          $env:CMAKE_ARGS = "-DLLAVA_BUILD=off $env:CMAKE_ARGS"
+
+          if ($packageVersion -gt [version]'0.2.13') {$env:CMAKE_ARGS = "-DGGML_NATIVE=off $env:CMAKE_ARGS"}
           if ($packageVersion -lt [version]'0.2.0') {
             python -m build --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$buildtag"
           } else {
@@ -239,12 +250,13 @@ jobs:
             New-Item $initpath -itemType File -value $newinit -force
             python -m build --wheel
           }
-          
+
       - name: Upload files to a GitHub release
         id: upload-release
         uses: svenstaro/upload-release-action@2.7.0
         continue-on-error: true
         with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: ./dist/*.whl
           tag: rocm
           file_glob: true
